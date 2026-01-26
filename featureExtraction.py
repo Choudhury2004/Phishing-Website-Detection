@@ -1,169 +1,101 @@
-from datetime import datetime
-import ipaddress
-import urllib
-import whois
-from urllib.parse import urlparse
 import re
-import requests
-from bs4 import BeautifulSoup
+import os
+import joblib
+import numpy as np
+import socket
+from urllib.parse import urlparse
+from sklearn.ensemble import GradientBoostingClassifier
 
-# Function to check if the URL contains an IP address
-def havingIP(url):
-    try:
-        ipaddress.ip_address(urlparse(url).netloc)
-        return 1
-    except ValueError:
-        return 0
+# ==============================================================================
+# MODEL INITIALIZATION
+# ==============================================================================
+MODEL_DIR = 'models'
+MODEL_PATH = os.path.join(MODEL_DIR, 'Phishing.pkl')
 
-# Function to check if the URL contains the '@' symbol
-def haveAtSign(url):
-    return 1 if '@' in urlparse(url).netloc else 0
+def _generate_clean_model():
+    """Generates a Gradient Boosting model trained on synthetic rules."""
+    if not os.path.exists(MODEL_DIR):
+        os.makedirs(MODEL_DIR)
+    
+    # We create a synthetic training set so the model understands specific "red flags"
+    # Features: [IP, @, Len, Dep, //, HTTPS, Short, Pre/Suf, DNS, Age, Exp, iframe, Mouse, Click, Redir, Ext, Digit, Case]
+    X_train = [
+        [0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0], # Perfectly clean (HTTPS exists, DNS exists)
+        [1,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0], # Has IP -> Phishing
+        [0,1,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0], # Has @ -> Phishing
+        [0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0], # No HTTPS AND Missing DNS -> Phishing
+        [0,0,0,0,0,1,0,0,1,0,0,0,0,0,0,0,0,0], # Has HTTPS but Missing DNS -> Phishing
+        [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0], # Unusual Extension -> Phishing
+        [0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0], # Shortened URL -> Phishing
+        [0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0], # Dash in domain -> Phishing
+        [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1], # Digits + Mixed Case -> Suspicious/Phishing
+    ]
+    # Labels: 0 = Legitimate, 1 = Phishing
+    y_train = [0, 1, 1, 1, 1, 1, 1, 1, 1]
 
-# Function to check URL length (phishing URLs often have long URLs)
-def urlLength(url):
-    return 1 if len(url) < 5 else 0
+    # Convert to numpy arrays
+    X_train = np.array(X_train)
+    y_train = np.array(y_train)
+    
+    # Initialize Gradient Boosting with more sensitivity
+    model = GradientBoostingClassifier(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42)
+    model.fit(X_train, y_train)
+    joblib.dump(model, MODEL_PATH)
 
-# Function to calculate URL depth (number of segments in the path)
-def urlDepth(url):
-    segments = urlparse(url).path.split('/')
-    return len([segment for segment in segments if segment])  # Count non-empty segments
+if not os.path.exists(MODEL_PATH):
+    _generate_clean_model()
 
-# Function to check for excessive redirections (often indicative of phishing)
-def redirection(url):
-    return 1 if url.count('//') > 6 else 0
+# ==============================================================================
+# FEATURE EXTRACTION LOGIC
+# ==============================================================================
 
-# Function to check if HTTPS is used in the URL
-def httpsInUrl(url):
-    return 1 if 'https' in urlparse(url).scheme else 0
-
-# Function to detect URL shortening services in the URL
-def urlShort(url):
-    shortening_services = (r"bit\.ly|goo\.gl|shorte\.st|go2l\.ink|x\.co|ow\.ly|t\.co|tinyurl|tr\.im|is\.gd|cli\.gs|"
-                           r"yfrog\.com|migre\.me|ff\.im|tiny\.cc|url4\.eu|twit\.ac|su\.pr|twurl\.nl|snipurl\.com|"
-                           r"short\.to|BudURL\.com|ping\.fm|post\.ly|Just\.as|bkite\.com|snipr\.com|fic\.kr|loopt\.us|"
-                           r"doiop\.com|short\.ie|kl\.am|wp\.me|rubyurl\.com|om\.ly|to\.ly|bit\.do|t\.co|lnkd\.in|db\.tt|"
-                           r"qr\.ae|adf\.ly|goo\.gl|bitly\.com|cur\.lv|tinyurl\.com|ow\.ly|bit\.ly|ity\.im|q\.gs|is\.gd|"
-                           r"po\.st|bc\.vc|twitthis\.com|u\.to|j\.mp|buzurl\.com|cutt\.us|u\.bb|yourls\.org|x\.co|"
-                           r"prettylinkpro\.com|scrnch\.me|filoops\.info|vzturl\.com|qr\.net|1url\.com|tweez\.me|v\.gd|"
-                           r"tr\.im|link\.zip\.net")
-    return 1 if re.search(shortening_services, url) else 0
-
-# Function to check for prefixes or suffixes in the domain name (e.g., '-' or '@')
-def prefixSuffix(url):
-    return 1 if '-' in urlparse(url).netloc else 0
-
-# Function to check if DNS records exist for the domain
-def dnsRecordExists(url):
-    try:
-        whois.whois(urlparse(url).netloc)
-        return 1
-    except Exception:
-        return 0
-
-# Function to retrieve the domain age (in months)
-def domainAge(domain_name):
-    try:
-        creation_date = domain_name.creation_date
-        expiration_date = domain_name.expiration_date
-
-        if isinstance(creation_date, str) or isinstance(expiration_date, str):
-            creation_date = datetime.strptime(creation_date, '%Y-%m-%d')
-            expiration_date = datetime.strptime(expiration_date, "%Y-%m-%d")
-
-        age_in_months = (expiration_date - creation_date).days / 30
-
-        return 1 if age_in_months < 6 else 0
-    except Exception:
-        return 1
-
-# Function to check if the domain is about to expire (in months)
-def domainExpiry(domain_name):
-    try:
-        expiration_date = domain_name.expiration_date
-
-        if isinstance(expiration_date, str):
-            expiration_date = datetime.strptime(expiration_date, "%Y-%m-%d")
-
-        time_until_expiry = (expiration_date - datetime.now()).days / 30
-
-        return 1 if time_until_expiry < 6 else 0
-    except Exception:
-        return 1
-
-# Function to check if the URL contains an iframe (potential phishing indicator)
-def iframe(response):
-    try:
-        return 1 if re.findall(r"<iframe|<frameBorder", response.text) else 0
-    except Exception:
-        return 1
-
-# Function to check if the URL triggers mouse-over events (potential phishing indicator)
-def mouseOver(response):
-    try:
-        return 1 if re.findall(r"<script>.+onmouseover.+</script>", response.text) else 0
-    except Exception:
-        return 1
-
-# Function to check if the URL disables right-click (potential phishing indicator)
-def rightClick(response):
-    try:
-        return 1 if re.findall(r"event\.button\s*==\s*2", response.text) else 0
-    except Exception:
-        return 1
-
-# Function to check if the URL triggers multiple redirections (potential phishing indicator)
-def forwarding(response):
-    try:
-        return 1 if len(response.history) > 4 else 0
-    except Exception:
-        return 1
-
-# Function to detect unusual extensions in the URL
-def unusualExtension(url):
-    unusual_extensions = (r"\.xyz|\.online|\.website|\.space|\.site|\.tech|\.info|\.pw|\.me|\.club")
-    return 1 if re.search(unusual_extensions, url) else 0
-
-# Function to detect numeric digits in the URL path (potential phishing indicator)
-def numericDigits(url):
-    path = urlparse(url).path
-    return 1 if any(char.isdigit() for char in path) else 0
-
-# Function to extract all features from a given URL
 def featureExtraction(url):
-    features = []
-
-    features.append(havingIP(url))
-    features.append(haveAtSign(url))
-    features.append(urlLength(url))
-    features.append(urlDepth(url))
-    features.append(redirection(url))
-    features.append(httpsInUrl(url))
-    features.append(urlShort(url))
-    features.append(prefixSuffix(url))
-
+    features = [0] * 18
+    url_lower = url.lower()
+    
+    # --- WEBSITE EXISTENCE CHECK (DNS CHECK) ---
+    website_exists = True
     try:
-        domain_info = whois.whois(urlparse(url).netloc)
+        check_url = url_lower
+        if not (check_url.startswith('http://') or check_url.startswith('https://')):
+            check_url = 'http://' + check_url
+        
+        domain = urlparse(check_url).netloc
+        if not domain:
+            domain = url_lower.split('/')[0]
+
+        socket.setdefaulttimeout(2) # Faster timeout
+        socket.gethostbyname(domain)
     except Exception:
-        domain_info = None
+        website_exists = False
 
-    features.append(dnsRecordExists(url))
-    features.append(1 if domain_info else domainAge(domain_info))
-    features.append(1 if domain_info else domainExpiry(domain_info))
-
+    # 0. Have IP
+    features[0] = 1 if re.search(r'(([01]?\d\d?|2[0-4]\d|25[0-5])\.){3}([01]?\d\d?|2[0-4]\d|25[0-5])', url) else 0
+    # 1. Have @ symbol
+    features[1] = 1 if "@" in url else 0
+    # 2. URL Length (Short is fine, very long is suspicious)
+    features[2] = 1 if len(url) > 75 else 0
+    # 3. URL Depth
+    features[3] = url.count('/')
+    # 4. Redirection //
+    features[4] = 1 if url.rfind('//') > 7 else 0
+    # 5. HTTPS in URL (0 if secure, 1 if insecure/no https)
+    features[5] = 1 if url_lower.startswith('https://') else 0
+    # 6. URL Shortening
+    features[6] = 1 if re.search(r"bit\.ly|goo\.gl|tinyurl", url) else 0
+    # 7. Prefix/Suffix (Dash in domain)
     try:
-        response = requests.get(url)
-    except Exception:
-        response = None
-
-    features.append(iframe(response))
-    features.append(mouseOver(response))
-    features.append(rightClick(response))
-    features.append(forwarding(response))
-    features.append(unusualExtension(url))
-    features.append(numericDigits(url))
-
-    # Ensure the feature vector has exactly 18 elements
-    if len(features) != 18:
-        features = features[:18]  # Trim to first 18 features
-
+        check_url = url if '://' in url else 'http://' + url
+        features[7] = 1 if '-' in urlparse(check_url).netloc else 0
+    except:
+        features[7] = 0
+    # 8. DNS Record (1 = Phishing/Does not exist)
+    features[8] = 0 if website_exists else 1
+    # 15. Unusual Extension
+    features[15] = 1 if any(url_lower.endswith(ext) for ext in [".xyz", ".top", ".work", ".ml", ".ga", ".cf"]) else 0
+    # 16. Numeric Digits
+    features[16] = 1 if any(char.isdigit() for char in url) else 0
+    # 17. Mixed Case Characters
+    features[17] = 1 if any(c.islower() for c in url) and any(c.isupper() for c in url) else 0
+    
     return features
